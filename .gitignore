@@ -1,0 +1,60 @@
+**/__pycache__/
+**/.idea/
+**/.vscode/
+**/venv/
+**~
+**.pyc
+**.log
+
+# AI tools
+.cursorindexignore
+.cursorignore
+.cursorrules
+.cursor/
+.claude/
+
+# AI CLI Crap
+GEMINI.md
+CLAUDE.md
+CODEX.md
+ANTHROPIC.md
+
+
+# C
+build/
+c*?_debug/
+
+# ionide
+.fake
+
+# Project Specific
+samples/src/**/*.d
+samples/src/**/*.o
+samples/bins/*
+!samples/bins/**/*.dll
+!samples/bins/**/*.so
+!samples/bins/**/*.dylib
+
+!src/include/**/*.h
+!src/include/**/*.hpp
+!src/include/**/*.hxx
+!src/include/**/*.hpp
+
+# Cython compiled files
+*.so
+src/d810/**/*.cpp
+src/d810/**/*.so
+src/d810/**/*.dll
+src/d810/**/*.html
+src/d810/**/*.so.dSYM
+
+.env
+_indexable
+
+# Auto-downloaded IDA SDK
+.ida-sdk/
+
+\.*db
+
+# docs
+docs/

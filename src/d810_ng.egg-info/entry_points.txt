@@ -1,0 +1,2 @@
+[console_scripts]
+install-speedups = d810.speedups.install:main

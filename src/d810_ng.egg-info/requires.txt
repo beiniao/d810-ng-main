@@ -1,0 +1,16 @@
+typing-extensions
+
+[dev]
+pyinstrument
+pytest>=7.0.0
+pytest-cov>=4.0.0
+pytest-forked>=1.6.0
+coverage[toml]>=7.0.0
+import-linter>=2.0
+
+[egraph]
+egglog>=12.0.0
+cloudpickle>=3.0.0
+
+[speedups]
+Cython>=3.0.0

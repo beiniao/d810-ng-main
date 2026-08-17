@@ -1,0 +1,274 @@
+from d810.core.typing import Union
+
+import ida_hexrays
+
+from d810.core import getLogger
+from d810.expr.ast import AstNode, mop_to_ast
+from d810.hexrays.cfg_utils import (
+    change_2way_block_conditional_successor,
+    is_conditional_jump,
+    make_2way_block_goto,
+)
+from d810.hexrays.hexrays_formatters import (
+    format_minsn_t,
+    opcode_to_string,
+    string_to_maturity,
+)
+from d810.optimizers.microcode.flow.handler import FlowOptimizationRule, FlowRulePriority
+from d810.optimizers.microcode.instructions.pattern_matching.handler import (
+    ast_generator,
+)
+from d810.core import Registrant
+
+logger = getLogger("D810.branch_fixer")
+optimizer_logger = getLogger("D810.optimizer")
+
+
+class JumpOptimizationRule(Registrant):
+    NAME = None
+    ORIGINAL_JUMP_OPCODES = []
+    LEFT_PATTERN = None
+    RIGHT_PATTERN = None
+
+    REPLACEMENT_OPCODE = None
+    REPLACEMENT_LEFT_PATTERN = None
+    REPLACEMENT_RIGHT_PATTERN = None
+
+    FUZZ_PATTERNS = True
+
+    def __init__(self):
+        self.fuzz_patterns = self.FUZZ_PATTERNS
+        self.left_pattern_candidates = []
+        self.right_pattern_candidates = []
+        self.jump_original_block_serial = None
+        self.direct_block_serial = None
+        self.jump_replacement_block_serial = None
+        self.maturities = []
+        self.config = {}
+        self.log_dir = None
+
+    def check_and_replace(self, blk, ins):
+        return None
+
+    def set_log_dir(self, log_dir):
+        self.log_dir = log_dir
+
+    def configure(self, fuzz_pattern=None, **kwargs):
+        self.config = kwargs if kwargs is not None else {}
+        if "maturities" in self.config.keys():
+            self.maturities = [string_to_maturity(x) for x in self.config["maturities"]]
+        if fuzz_pattern is not None:
+            self.fuzz_patterns = fuzz_pattern
+        self._generate_pattern_candidates()
+
+    def _generate_pattern_candidates(self):
+        self.fuzz_patterns = self.FUZZ_PATTERNS
+        if self.LEFT_PATTERN is not None:
+            self.LEFT_PATTERN.reset_mops()
+            if not self.fuzz_patterns:
+                self.left_pattern_candidates = [self.LEFT_PATTERN]
+            else:
+                self.left_pattern_candidates = ast_generator(self.LEFT_PATTERN)
+        if self.RIGHT_PATTERN is not None:
+            self.RIGHT_PATTERN.reset_mops()
+            if not self.fuzz_patterns:
+                self.right_pattern_candidates = [self.RIGHT_PATTERN]
+            else:
+                self.right_pattern_candidates = ast_generator(self.RIGHT_PATTERN)
+
+    @property
+    def name(self):
+        if self.NAME is not None:
+            return self.NAME
+        return self.__class__.__name__
+
+    def check_candidate(
+        self, opcode, left_candidate: AstNode, right_candidate: AstNode
+    ):
+        return False
+
+    def get_valid_candidates(
+        self, instruction, left_ast: AstNode, right_ast: AstNode, stop_early=True
+    ):
+        valid_candidates = []
+        if left_ast is None or right_ast is None:
+            return []
+
+        for left_candidate_pattern in self.left_pattern_candidates:
+            if not left_candidate_pattern.check_pattern_and_copy_mops(left_ast):
+                continue
+            for right_candidate_pattern in self.right_pattern_candidates:
+                if not right_candidate_pattern.check_pattern_and_copy_mops(right_ast):
+                    continue
+                if not self.check_candidate(
+                    instruction.opcode, left_candidate_pattern, right_candidate_pattern
+                ):
+                    continue
+                valid_candidates.append(
+                    [left_candidate_pattern, right_candidate_pattern]
+                )
+                if stop_early:
+                    return valid_candidates
+        return []
+
+    def check_pattern_and_replace(
+        self, blk: ida_hexrays.mblock_t, instruction: ida_hexrays.minsn_t, left_ast: AstNode, right_ast: AstNode
+    ):
+        if instruction.opcode not in self.ORIGINAL_JUMP_OPCODES:
+            return None
+        if instruction.d is None or instruction.d.t != ida_hexrays.mop_b:
+            return None
+        self.jump_original_block_serial = instruction.d.b
+        if blk.nextb is None:
+            return None  # or bail gracefully
+        self.direct_block_serial = blk.nextb.serial
+        self.jump_replacement_block_serial = None
+        valid_candidates = self.get_valid_candidates(
+            instruction, left_ast, right_ast, stop_early=True
+        )
+        if len(valid_candidates) == 0:
+            return None
+        # if self.jump_original_block_serial is None:
+        #     self.jump_replacement_block_serial = self.jump_original_block_serial
+        if self.jump_original_block_serial is None and self.direct_block_serial is None:
+            return None
+        left_candidate, right_candidate = valid_candidates[0]
+        new_ins = self.get_replacement(instruction, left_candidate, right_candidate)
+        return new_ins
+
+    def get_replacement(
+        self, original_ins: ida_hexrays.minsn_t, left_candidate: AstNode, right_candidate: AstNode
+    ):
+        new_left_mop = None
+        new_right_mop = None
+        new_dst_mop = None
+
+        if self.jump_original_block_serial is not None:
+            new_dst_mop = ida_hexrays.mop_t()
+            new_dst_mop.make_blkref(self.jump_replacement_block_serial)
+
+        if self.REPLACEMENT_LEFT_PATTERN is not None:
+            is_ok = self.REPLACEMENT_LEFT_PATTERN.update_leafs_mop(
+                left_candidate, right_candidate
+            )
+            if not is_ok:
+                return None
+            new_left_mop = self.REPLACEMENT_LEFT_PATTERN.create_mop(original_ins.ea)
+        if self.REPLACEMENT_RIGHT_PATTERN is not None:
+            is_ok = self.REPLACEMENT_RIGHT_PATTERN.update_leafs_mop(
+                left_candidate, right_candidate
+            )
+            if not is_ok:
+                return None
+            new_right_mop = self.REPLACEMENT_RIGHT_PATTERN.create_mop(original_ins.ea)
+
+        new_ins = self.create_new_ins(
+            original_ins, new_left_mop, new_right_mop, new_dst_mop
+        )
+        return new_ins
+
+    def create_new_ins(
+        self,
+        original_ins: ida_hexrays.minsn_t,
+        new_left_mop: ida_hexrays.mop_t,
+        new_right_mop: Union[None, ida_hexrays.mop_t] = None,
+        new_dst_mop: Union[None, ida_hexrays.mop_t] = None,
+    ) -> ida_hexrays.minsn_t:
+        new_ins = ida_hexrays.minsn_t(original_ins)
+        new_ins.opcode = self.REPLACEMENT_OPCODE
+        if self.REPLACEMENT_OPCODE == ida_hexrays.m_goto:
+            new_ins.l.erase()
+            new_ins.r.erase()
+            new_ins.d = new_dst_mop
+            return new_ins
+        new_ins.l = new_left_mop
+        if new_right_mop is not None:
+            new_ins.r = new_right_mop
+        if new_dst_mop is not None:
+            new_ins.d = new_dst_mop
+        return new_ins
+
+    @property
+    def description(self):
+        if self.LEFT_PATTERN is not None:
+            self.LEFT_PATTERN.reset_mops()
+        if self.RIGHT_PATTERN is not None:
+            self.RIGHT_PATTERN.reset_mops()
+        return "{0}: {1}, {2}".format(
+            ",".join([opcode_to_string(x) for x in self.ORIGINAL_JUMP_OPCODES]),
+            self.LEFT_PATTERN,
+            self.RIGHT_PATTERN,
+        )
+
+
+class JumpFixer(FlowOptimizationRule):
+    PRIORITY = FlowRulePriority.CLEANUP_JUMPS
+
+    def __init__(self):
+        super().__init__()
+        self.known_rules = []
+        self.rules = []
+        # Auto-register all JumpOptimizationRule subclasses
+        for rule_cls in JumpOptimizationRule.registry.values():
+            self.register_rule(rule_cls())
+
+    def register_rule(self, rule: JumpOptimizationRule):
+        self.known_rules.append(rule)
+
+    def configure(self, kwargs):
+        super().configure(kwargs)
+
+        self.rules.clear()
+
+        if "enabled_rules" in self.config.keys():
+            for rule in self.known_rules:
+                if rule.name in self.config["enabled_rules"]:
+                    rule.configure()
+                    self.rules.append(rule)
+                    optimizer_logger.debug(
+                        "JumpFixer enables rule {0}".format(rule.name)
+                    )
+                else:
+                    optimizer_logger.debug(
+                        "JumpFixer disables rule {0}".format(rule.name)
+                    )
+
+    def optimize(self, blk: ida_hexrays.mblock_t) -> bool:
+        if not is_conditional_jump(blk):
+            return False
+        left_ast = mop_to_ast(blk.tail.l)
+        right_ast = mop_to_ast(blk.tail.r)
+        for rule in self.rules:
+            try:
+                new_ins = rule.check_pattern_and_replace(
+                    blk, blk.tail, left_ast, right_ast
+                )
+                if new_ins:
+                    optimizer_logger.info("Rule {0} matched:".format(rule.name))
+                    optimizer_logger.info(
+                        "  orig: {0}".format(format_minsn_t(blk.tail))
+                    )
+                    optimizer_logger.info("  new : {0}".format(format_minsn_t(new_ins)))
+                    if new_ins.opcode == ida_hexrays.m_goto:
+                        make_2way_block_goto(blk, new_ins.d.b)
+                        return True
+                    else:
+                        # In-place modification: safer than make_nop + insert_into_block
+                        # because it avoids CFG consistency issues at certain maturities.
+                        # The old approach (delete + insert) could cause INTERR crashes.
+                        # TODO(d810ng-xxx): Create helper for safe in-place CFG modification
+                        # Pattern: modify instruction in place rather than delete+insert to avoid
+                        # CFG consistency issues and INTERR crashes.
+                        tail = blk.tail
+                        tail.opcode = new_ins.opcode
+                        tail.l = new_ins.l
+                        tail.r = new_ins.r
+                        tail.d = new_ins.d
+                        return True
+            except RuntimeError as e:
+                optimizer_logger.error(
+                    "Error during rule {0} for instruction {1}: {2}".format(
+                        rule, format_minsn_t(blk.tail), e
+                    )
+                )
+        return False

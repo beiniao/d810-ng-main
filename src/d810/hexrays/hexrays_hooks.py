@@ -1,0 +1,904 @@
+from __future__ import annotations
+
+import enum
+import os
+import pathlib
+import time
+from collections import defaultdict
+
+from d810.core import typing
+import ida_hexrays
+
+from d810.core import getLogger
+from d810.core.cymode import CythonMode
+from d810.core.rule_scope import PIPELINE_FLOW, PIPELINE_INSTRUCTION
+from d810.errors import D810Exception
+from d810.expr.z3_utils import log_z3_instructions
+from d810.hexrays.cfg_utils import safe_verify
+from d810.hexrays.hexrays_formatters import (
+    count_minsn_nodes,
+    dump_microcode_for_debug,
+    format_minsn_t,
+    maturity_to_string,
+)
+from d810.hexrays.hexrays_helpers import check_ins_mop_size_are_ok
+
+# ---------------------------------------------------------------------------
+# hash_minsn: Cython fast path with pure-Python fallback
+# ---------------------------------------------------------------------------
+# The Cython version (in speedups/cythxr/_chexrays_api.pyx) hashes the opcode
+# and all three operands (l, r, d) at the C level for speed.  When Cython is
+# unavailable we fall back to hashing the printed representation of the
+# instruction, which is slower but always available.
+#
+# The OptimizationCache class (in d810.optimizers.caching) was considered for
+# seen-hash storage but rejected: it is SQLite-backed, function-level, and
+# designed for cross-session persistence -- far too heavy for per-instruction,
+# per-decompilation cycle detection.  A lightweight
+# ``dict[int, set[int]]`` (instruction EA -> set of post-rewrite hashes) is
+# used instead.
+# ---------------------------------------------------------------------------
+_cy_hash_minsn = None
+if CythonMode().is_enabled():
+    try:
+        from d810.speedups.cythxr._chexrays_api import hash_minsn as _cy_hash_minsn
+    except ImportError:
+        pass
+
+
+def _hash_minsn_fallback(ins: ida_hexrays.minsn_t, func_entry_ea: int = 0) -> int:
+    """Pure-Python fallback for hashing an minsn_t.
+
+    Uses the printed representation of the instruction as a proxy for its
+    structural content.  Slower than Cython but always available.
+    """
+    return hash((ins.opcode, ins._print(), func_entry_ea))
+
+
+def hash_minsn(ins: ida_hexrays.minsn_t, func_entry_ea: int = 0) -> int:
+    """Return a structural hash for an minsn_t, using Cython when available."""
+    if _cy_hash_minsn is not None:
+        try:
+            return int(_cy_hash_minsn(ins, func_entry_ea))
+        except Exception:
+            pass
+    return _hash_minsn_fallback(ins, func_entry_ea)
+# Note: VerifiableRule and adapt_rules are loaded/filtered in manager.py
+# Rules are added to PatternOptimizer via add_rule() based on project config
+
+# Import experimental rules that depend on optimizer extensions
+# These rules use context-aware features and can't be in mba.rules
+from d810.optimizers.microcode.instructions.pattern_matching import experimental  # noqa: F401
+
+# Try to import egglog-based optimizer (optional dependency)
+try:
+    from d810.mba.backends.egglog_backend import EGGLOG_AVAILABLE
+    if EGGLOG_AVAILABLE:
+        # Import to trigger auto-registration of EgglogOptimizer
+        from d810.optimizers.microcode.instructions.egraph import egglog_handler  # noqa: F401
+        # Import to trigger auto-registration of BlockLevelEgglogOptimizer
+        from d810.optimizers.microcode.flow.egraph import block_optimizer  # noqa: F401
+except ImportError:
+    EGGLOG_AVAILABLE = False
+from d810.hexrays.ctree_hooks import CtreeOptimizerManager
+from d810.optimizers.microcode.flow.context import FlowMaturityContext
+from d810.optimizers.microcode.flow.handler import FlowOptimizationRule
+from d810.optimizers.microcode.instructions.handler import (
+    InstructionOptimizationRule,
+    InstructionOptimizer,
+)
+
+main_logger = getLogger("D810")
+optimizer_logger = getLogger("D810.optimizer")
+
+DEFAULT_OPTIMIZATION_PATTERN_MATURITIES = [
+    ida_hexrays.MMAT_PREOPTIMIZED,
+    ida_hexrays.MMAT_LOCOPT,
+    ida_hexrays.MMAT_CALLS,
+    ida_hexrays.MMAT_GLBOPT1,
+]
+DEFAULT_OPTIMIZATION_CHAIN_MATURITIES = [
+    ida_hexrays.MMAT_PREOPTIMIZED,
+    ida_hexrays.MMAT_LOCOPT,
+    ida_hexrays.MMAT_CALLS,
+    ida_hexrays.MMAT_GLBOPT1,
+]
+DEFAULT_OPTIMIZATION_Z3_MATURITIES = [ida_hexrays.MMAT_PREOPTIMIZED, ida_hexrays.MMAT_LOCOPT, ida_hexrays.MMAT_CALLS, ida_hexrays.MMAT_GLBOPT1]
+DEFAULT_OPTIMIZATION_EARLY_MATURITIES = [ida_hexrays.MMAT_GENERATED, ida_hexrays.MMAT_PREOPTIMIZED]
+DEFAULT_OPTIMIZATION_PEEPHOLE_MATURITIES = [
+    ida_hexrays.MMAT_PREOPTIMIZED,
+    ida_hexrays.MMAT_LOCOPT,
+    ida_hexrays.MMAT_CALLS,
+    ida_hexrays.MMAT_GLBOPT1,
+    ida_hexrays.MMAT_GLBOPT2,
+]
+DEFAULT_ANALYZER_MATURITIES = [ida_hexrays.MMAT_PREOPTIMIZED, ida_hexrays.MMAT_LOCOPT, ida_hexrays.MMAT_CALLS, ida_hexrays.MMAT_GLBOPT1]
+
+
+if typing.TYPE_CHECKING:
+    from d810.core import OptimizationStatistics
+    from d810.optimizers.microcode.instructions.analysis.handler import (
+        InstructionAnalyzer,
+    )
+    from d810.optimizers.microcode.instructions.chain.handler import ChainOptimizer
+    from d810.optimizers.microcode.instructions.early.handler import EarlyOptimizer
+    from d810.optimizers.microcode.instructions.egraph.egglog_handler import (
+        EgglogOptimizer,
+    )
+    from d810.optimizers.microcode.instructions.pattern_matching.handler import (
+        PatternOptimizer,
+    )
+    from d810.optimizers.microcode.instructions.peephole.handler import (
+        PeepholeOptimizer,
+    )
+    from d810.optimizers.microcode.instructions.z3.handler import Z3Optimizer
+
+
+class InstructionOptimizerManager(ida_hexrays.optinsn_t):
+    def __init__(self, stats: OptimizationStatistics, log_dir: pathlib.Path):
+        optimizer_logger.debug("Initializing {0}...".format(self.__class__.__name__))
+        super().__init__()
+        self.log_dir = log_dir
+        self.stats = stats
+        self.instruction_visitor = InstructionVisitorManager(self)
+        self._last_optimizer_tried = None
+        self.current_maturity = None
+        self.current_blk_serial = None
+        self.generate_z3_code = False
+        self.dump_intermediate_microcode = False
+        self._rule_scope_service = None
+        self._rule_scope_project_name = ""
+        self._rule_scope_idb_key = ""
+        self._rule_scope_func_ea = -1
+        self._active_instruction_rule_names_by_maturity: dict[int, frozenset[str]] = {}
+
+        # Cycle detection: state-revisit. For each instruction EA we record
+        # the set of distinct pre-rewrite state hashes ever observed. A
+        # "cycle" is when we revisit a prior pre-state AFTER having been at
+        # some different state in between (Rule A: X->Y, Rule B: Y->X, then
+        # we see X again => cycle). Re-presentation of the same pre-state
+        # repeatedly (Hex-Rays giving us the unchanged ins across passes) is
+        # NOT a cycle and stays allowed -- the previous post-hash keying
+        # bracketed valid idempotent re-folds and undid them, leaving
+        # obfuscated forms in the final pseudocode.
+        self._rewrite_seen: dict[int, set[int]] = defaultdict(set)
+
+        # Optional event emitter — set by D810Manager after construction to
+        # allow emitting DecompilationEvent.MATURITY_CHANGED events.
+        self.event_emitter = None
+
+        self.instruction_optimizers = []
+        self._active_optimizers: list = []
+        # usage tracking moved to centralized statistics object
+        ChainOptimizer: type[ChainOptimizer] = InstructionOptimizer.get(
+            "ChainOptimizer"
+        )
+        EarlyOptimizer: type[EarlyOptimizer] = InstructionOptimizer.get(
+            "EarlyOptimizer"
+        )
+        InstructionAnalyzer: type[InstructionAnalyzer] = InstructionOptimizer.get(
+            "InstructionAnalyzer"
+        )
+        PatternOptimizer: type[PatternOptimizer] = InstructionOptimizer.get(
+            "PatternOptimizer"
+        )
+        PeepholeOptimizer: type[PeepholeOptimizer] = InstructionOptimizer.get(
+            "PeepholeOptimizer"
+        )
+        Z3Optimizer: type[Z3Optimizer] = InstructionOptimizer.get("Z3Optimizer")
+
+        # PatternOptimizer: Rules are added via add_rule() from D810Manager based on
+        # project configuration. This ensures only rules enabled in the project's
+        # ins_rules (with is_activated: true) are loaded.
+        # Previously this loaded ALL VerifiableRules, bypassing project config.
+        self.add_optimizer(
+            PatternOptimizer(
+                DEFAULT_OPTIMIZATION_PATTERN_MATURITIES,
+                stats=self.stats,
+                log_dir=self.log_dir,
+            )
+        )
+
+        # EXPERIMENTAL: Egglog-based optimizer using equality saturation
+        # Currently DISABLED by default because egglog's saturation() is too slow
+        # for real-time IDA decompilation. The overhead of running equality saturation
+        # on every instruction makes decompilation impractically slow (>100x slower).
+        #
+        # The egglog backend still works correctly for batch/offline analysis.
+        # To enable for testing, set ENABLE_EGGLOG_OPTIMIZER = True below:
+        ENABLE_EGGLOG_OPTIMIZER = False  # Set to True to enable (SLOW!)
+
+        if ENABLE_EGGLOG_OPTIMIZER and EGGLOG_AVAILABLE:
+            EgglogOptimizer: type[EgglogOptimizer] = InstructionOptimizer.get(
+                "EgglogOptimizer"
+            )
+            if EgglogOptimizer is not None:
+                self.add_optimizer(
+                    EgglogOptimizer(
+                        DEFAULT_OPTIMIZATION_PATTERN_MATURITIES,
+                        stats=self.stats,
+                        log_dir=self.log_dir,
+                    )
+                )
+                optimizer_logger.warning(
+                    "[EgglogOptimizer] ENABLED (experimental) - using equality saturation. "
+                    "Expect SLOW decompilation!"
+                )
+            else:
+                optimizer_logger.debug("[EgglogOptimizer] Not registered - skipping")
+        elif EGGLOG_AVAILABLE:
+            optimizer_logger.debug("[EgglogOptimizer] Disabled (set ENABLE_EGGLOG_OPTIMIZER=True to enable)")
+        else:
+            optimizer_logger.debug("[EgglogOptimizer] egglog not installed - skipping")
+
+        self.add_optimizer(
+            ChainOptimizer(
+                DEFAULT_OPTIMIZATION_CHAIN_MATURITIES,
+                stats=self.stats,
+                log_dir=self.log_dir,
+            )
+        )
+        self.add_optimizer(
+            Z3Optimizer(
+                DEFAULT_OPTIMIZATION_Z3_MATURITIES,
+                stats=self.stats,
+                log_dir=self.log_dir,
+            )
+        )
+        self.add_optimizer(
+            EarlyOptimizer(
+                DEFAULT_OPTIMIZATION_EARLY_MATURITIES,
+                stats=self.stats,
+                log_dir=self.log_dir,
+            )
+        )
+        self.add_optimizer(
+            PeepholeOptimizer(
+                DEFAULT_OPTIMIZATION_PEEPHOLE_MATURITIES,
+                stats=self.stats,
+                log_dir=self.log_dir,
+            )
+        )
+        self.analyzer = InstructionAnalyzer(
+            DEFAULT_ANALYZER_MATURITIES,
+            stats=self.stats,
+            log_dir=self.log_dir,
+        )
+
+    def add_optimizer(self, optimizer: InstructionOptimizer):
+        self.instruction_optimizers.append(optimizer)
+
+    def add_rule(self, rule: InstructionOptimizationRule):
+        # optimizer_log.info("Trying to add rule {0}".format(rule))
+        for ins_optimizer in self.instruction_optimizers:
+            ins_optimizer.add_rule(rule)
+        self.analyzer.add_rule(rule)
+
+    def reset_cycle_detection(self) -> None:
+        """Clear the rewrite-cycle seen set.
+
+        Called on decompilation start (via DecompilationEvent.STARTED in the
+        manager) and on maturity change (in log_info_on_input).
+        """
+        self._rewrite_seen.clear()
+
+    def func(self, blk: ida_hexrays.mblock_t, ins: ida_hexrays.minsn_t) -> bool:
+        self.log_info_on_input(blk, ins)
+        try:
+            optimization_performed = self.optimize(blk, ins)
+
+            if not optimization_performed:
+                optimization_performed = ins.for_all_insns(self.instruction_visitor)
+
+            if optimization_performed:
+                ins.optimize_solo()
+
+                if blk is not None:
+                    blk.mark_lists_dirty()
+                    safe_verify(
+                        blk.mba, "rewriting", logger_func=optimizer_logger.error
+                    )
+
+            return bool(optimization_performed)
+        except RuntimeError as e:
+            optimizer_logger.error(
+                "RuntimeError while optimizing ins {0} with {1}: {2}".format(
+                    format_minsn_t(ins), self._last_optimizer_tried, e
+                )
+            )
+        except D810Exception as e:
+            optimizer_logger.error(
+                "D810Exception while optimizing ins {0} with {1}: {2}".format(
+                    format_minsn_t(ins), self._last_optimizer_tried, e
+                )
+            )
+        return False
+
+    # statistics are managed centrally via the stats object
+
+    def log_info_on_input(self, blk: ida_hexrays.mblock_t, ins: ida_hexrays.minsn_t):
+        mba: ida_hexrays.mbl_array_t = blk.mba
+
+        if (mba is not None) and (mba.maturity != self.current_maturity):
+            new_maturity = mba.maturity
+            self.current_maturity = new_maturity
+            main_logger.update_maturity(maturity_to_string(self.current_maturity))
+            if self.event_emitter is not None:
+                self.event_emitter.emit(DecompilationEvent.MATURITY_CHANGED, new_maturity)
+            if main_logger.debug_on:
+                main_logger.debug(
+                    "Instruction optimization function called at maturity: %s",
+                    maturity_to_string(self.current_maturity),
+                )
+            self.analyzer.set_maturity(self.current_maturity)
+            self.current_blk_serial = None
+            # Reset cycle detection on maturity change -- instructions are
+            # renumbered / restructured between maturity levels so old hashes
+            # are no longer meaningful.
+            self.reset_cycle_detection()
+            self._active_instruction_rule_names_by_maturity.clear()
+
+            for ins_optimizer in self.instruction_optimizers:
+                ins_optimizer.cur_maturity = self.current_maturity
+
+            # Pre-compute which optimizers are active at this maturity
+            self._active_optimizers = [
+                opt for opt in self.instruction_optimizers
+                if self.current_maturity in opt.maturities
+            ]
+
+            if self.dump_intermediate_microcode:
+                dump_microcode_for_debug(
+                    mba, self.log_dir, "input_instruction_optimizer"
+                )
+
+        if blk.serial != self.current_blk_serial:
+            self.current_blk_serial = blk.serial
+
+    def configure(
+        self, generate_z3_code=False, dump_intermediate_microcode=False, **kwargs
+    ):
+        old_scope = (
+            self._rule_scope_service,
+            self._rule_scope_project_name,
+            self._rule_scope_idb_key,
+        )
+        self.generate_z3_code = generate_z3_code
+        self.dump_intermediate_microcode = dump_intermediate_microcode
+        self._rule_scope_service = kwargs.get(
+            "rule_scope_service",
+            self._rule_scope_service,
+        )
+        self._rule_scope_project_name = str(
+            kwargs.get("rule_scope_project_name", self._rule_scope_project_name)
+        )
+        self._rule_scope_idb_key = str(
+            kwargs.get("rule_scope_idb_key", self._rule_scope_idb_key)
+        )
+        new_scope = (
+            self._rule_scope_service,
+            self._rule_scope_project_name,
+            self._rule_scope_idb_key,
+        )
+        if new_scope != old_scope:
+            self._rule_scope_func_ea = -1
+            self._active_instruction_rule_names_by_maturity.clear()
+            # Invalidate compiled rule views on scope change (PR3)
+            for optimizer in self.instruction_optimizers:
+                if hasattr(optimizer, 'invalidate'):
+                    optimizer.invalidate()
+
+    @staticmethod
+    def _rule_name(rule: object) -> str:
+        return str(getattr(rule, "name", rule.__class__.__name__))
+
+    def _resolve_active_instruction_rule_names(
+        self,
+        blk: ida_hexrays.mblock_t,
+    ) -> frozenset[str]:
+        if self._rule_scope_service is None:
+            # FAIL CLOSED: If rule scope service not initialized, run NO rules
+            # instead of ALL rules. This prevents expression bloat when optimizer
+            # callbacks fire before configure() is called.
+            optimizer_logger.warning(
+                "Rule scope service not initialized at optimize time - no rules will run. "
+                "This may indicate a race condition during initialization."
+            )
+            return frozenset()
+        if blk is None or blk.mba is None or blk.mba.entry_ea is None:
+            return frozenset()
+        if self.current_maturity is None:
+            return frozenset()
+        func_ea = int(blk.mba.entry_ea)
+        maturity = int(self.current_maturity)
+        if func_ea != self._rule_scope_func_ea:
+            self._rule_scope_func_ea = func_ea
+            self._active_instruction_rule_names_by_maturity.clear()
+        cached = self._active_instruction_rule_names_by_maturity.get(maturity)
+        if cached is not None:
+            return cached
+        active_rules = self._rule_scope_service.get_active_rules(
+            project_name=self._rule_scope_project_name,
+            idb_key=self._rule_scope_idb_key,
+            func_ea=func_ea,
+            pipeline=PIPELINE_INSTRUCTION,
+            maturity=maturity,
+        )
+        names = frozenset(self._rule_name(rule) for rule in active_rules)
+        self._active_instruction_rule_names_by_maturity[maturity] = names
+        return names
+
+    def optimize(self, blk: ida_hexrays.mblock_t, ins: ida_hexrays.minsn_t) -> bool:
+        # optimizer_log.info("Trying to optimize {0}".format(format_minsn_t(ins)))
+        allowed_rule_names = self._resolve_active_instruction_rule_names(blk)
+        for ins_optimizer in self._active_optimizers:
+            self._last_optimizer_tried = ins_optimizer
+            new_ins = ins_optimizer.get_optimized_instruction(
+                blk,
+                ins,
+                allowed_rule_names=allowed_rule_names,
+            )
+
+            if new_ins is not None:
+                if not check_ins_mop_size_are_ok(new_ins):
+                    if check_ins_mop_size_are_ok(ins):
+                        main_logger.error(
+                            "Invalid optimized instruction (%s) for maturity %s:\n\toptimized: %s\n\toriginal: %s",
+                            ins_optimizer.name,
+                            maturity_to_string(self.current_maturity),  # type: ignore
+                            format_minsn_t(new_ins),
+                            format_minsn_t(ins),
+                        )
+                    else:
+                        main_logger.error(
+                            "Invalid original instruction (%s) for maturity %s:\n\toptimized: %s\n\toriginal: %s",
+                            ins_optimizer.name,
+                            maturity_to_string(self.current_maturity),  # type: ignore
+                            format_minsn_t(new_ins),
+                            format_minsn_t(ins),
+                        )
+                else:
+                    # --- expression size guard ---
+                    # Reject replacements that significantly increase expression size.
+                    # This is a defense-in-depth measure against rules that cause
+                    # expression bloat (e.g., CstSimplificationRule4's 4.24x bloat).
+                    # Check BEFORE the cycle detection hash to avoid polluting the
+                    # seen-hash set with bloated replacements.
+                    original_nodes = count_minsn_nodes(ins)
+                    new_nodes = count_minsn_nodes(new_ins)
+                    max_allowed_nodes = original_nodes * 2
+
+                    if new_nodes > max_allowed_nodes and original_nodes > 0:
+                        optimizer_logger.warning(
+                            "Expression bloat detected at %s by %s: "
+                            "%d nodes -> %d nodes (%.2fx, max allowed 2x) -- "
+                            "rejecting replacement",
+                            hex(ins.ea),
+                            ins_optimizer.name,
+                            original_nodes,
+                            new_nodes,
+                            new_nodes / original_nodes,
+                        )
+                        if self.stats is not None:
+                            self.stats.record_expression_bloat_rejected(
+                                ins_optimizer.name,
+                                hex(ins.ea),
+                            )
+                        return False
+                    # --- end expression size guard ---
+
+                    # --- cycle detection guard (state-revisit) ---
+                    # Treat as a cycle ONLY when this instruction's pre-state
+                    # was already seen at this EA AND we have observed other
+                    # distinct pre-states in between (X -> Y -> ... -> X). A
+                    # simple repeated re-presentation of the same pre-state
+                    # (Hex-Rays giving us the same input across passes) is NOT
+                    # a cycle: it represents idempotent re-folding, harmless.
+                    #
+                    # Bypass: set D810_NO_CYCLE_DETECT=1 to disable the guard
+                    # entirely (diagnostic only).
+                    if os.environ.get("D810_NO_CYCLE_DETECT") == "1":
+                        ins.swap(new_ins)
+                    else:
+                        try:
+                            func_ea = blk.mba.entry_ea if blk and blk.mba else 0
+                        except Exception:
+                            func_ea = 0
+                        pre_hash = hash_minsn(ins, func_ea)
+                        seen_states = self._rewrite_seen[ins.ea]
+
+                        if pre_hash in seen_states and len(seen_states) > 1:
+                            # We've been at this pre-state before AND in
+                            # between we've been at >=1 other state -- so
+                            # something flipped us back. Real cycle: refuse
+                            # the fold and leave the ins as is (no swap done
+                            # yet, no undo needed).
+                            optimizer_logger.warning(
+                                "Cycle detected for instruction at %s by %s -- "
+                                "breaking rewrite loop",
+                                hex(ins.ea),
+                                ins_optimizer.name,
+                            )
+                            if self.stats is not None:
+                                self.stats.record_cycle_detected(
+                                    ins_optimizer.name,
+                                    hex(ins.ea),
+                                )
+                            return False
+
+                        ins.swap(new_ins)
+                        seen_states.add(pre_hash)
+                    # --- end cycle detection guard ---
+
+                    if self.stats is not None:
+                        self.stats.record_optimizer_match(ins_optimizer.name)
+
+                    if self.generate_z3_code:
+                        try:
+                            log_z3_instructions(new_ins, ins)
+                        except KeyError:
+                            pass
+                    return True
+
+        self.analyzer.analyze(blk, ins)
+        return False
+
+
+class InstructionVisitorManager(ida_hexrays.minsn_visitor_t):
+    def __init__(self, optimizer: InstructionOptimizerManager):
+        optimizer_logger.debug("Initializing {0}...".format(self.__class__.__name__))
+        super().__init__()
+        self.instruction_optimizer = optimizer
+
+    def visit_minsn(self) -> bool:
+        return self.instruction_optimizer.optimize(self.blk, self.curins)
+
+
+class BlockOptimizerManager(ida_hexrays.optblock_t):
+    # Maximum number of block-optimizer passes allowed at a single maturity
+    # level before we bail out.  This is a safety net against infinite loops
+    # where the optimizer keeps matching but never converges.
+    _MAX_PASSES_PER_MATURITY = 500
+
+    def __init__(self, stats: OptimizationStatistics, log_dir: pathlib.Path):
+        optimizer_logger.debug("Initializing {0}...".format(self.__class__.__name__))
+        super().__init__()
+        self.log_dir = log_dir
+        self.stats = stats
+        self.cfg_rules: list[FlowOptimizationRule] = []
+        self._rule_scope_service = None
+        self._rule_scope_project_name = ""
+        self._rule_scope_idb_key = ""
+        self._perf_compare_rule_scope = False
+        self._perf_counters = {
+            "scoped_calls": 0,
+            "legacy_calls": 0,
+            "scoped_candidates_total": 0,
+            "legacy_candidates_total": 0,
+            "scoped_lookup_ns": 0,
+        }
+
+        self.current_maturity = None
+        self._pass_count = 0
+        self._flow_context: FlowMaturityContext | None = None
+        self._flow_context_key: tuple[int, int] | None = None
+        # usage tracking moved to centralized statistics object
+
+    def reset_pass_counter(self) -> None:
+        """Reset the per-maturity pass counter.
+
+        Called when maturity changes so the guard does not carry over.
+        """
+        self._pass_count = 0
+
+    def _invalidate_flow_context(self, reason: str = "") -> None:
+        if self._flow_context is not None and reason:
+            optimizer_logger.debug("Invalidating flow context: %s", reason)
+        self._flow_context = None
+        self._flow_context_key = None
+
+    def reset_perf_counters(self) -> None:
+        for key in self._perf_counters:
+            self._perf_counters[key] = 0
+
+    def report_perf_counters(self) -> None:
+        scoped_calls = int(self._perf_counters["scoped_calls"])
+        legacy_calls = int(self._perf_counters["legacy_calls"])
+        scoped_candidates = int(self._perf_counters["scoped_candidates_total"])
+        legacy_candidates = int(self._perf_counters["legacy_candidates_total"])
+        scoped_lookup_ns = int(self._perf_counters["scoped_lookup_ns"])
+
+        if scoped_calls == 0 and legacy_calls == 0:
+            return
+        scoped_avg = (scoped_candidates / scoped_calls) if scoped_calls else 0.0
+        legacy_avg = (legacy_candidates / legacy_calls) if legacy_calls else 0.0
+        lookup_us = (scoped_lookup_ns / scoped_calls / 1000.0) if scoped_calls else 0.0
+        optimizer_logger.info(
+            "Rule iteration perf: scoped_calls=%d legacy_calls=%d "
+            "scoped_avg_candidates=%.2f legacy_avg_candidates=%.2f "
+            "scoped_lookup_avg_us=%.2f compare=%s",
+            scoped_calls,
+            legacy_calls,
+            scoped_avg,
+            legacy_avg,
+            lookup_us,
+            self._perf_compare_rule_scope,
+        )
+
+    def func(self, blk: ida_hexrays.mblock_t):
+        self.log_info_on_input(blk)
+
+        # Bug 3 fix: pass guard -- if the block optimizer has been called too
+        # many times at the same maturity without a maturity change, bail out
+        # to prevent infinite-loop hangs.
+        self._pass_count += 1
+        if self._pass_count > self._MAX_PASSES_PER_MATURITY:
+            if self._pass_count == self._MAX_PASSES_PER_MATURITY + 1:
+                optimizer_logger.warning(
+                    "BlockOptimizer exceeded %d passes at maturity %s; "
+                    "suppressing further optimizations until maturity changes",
+                    self._MAX_PASSES_PER_MATURITY,
+                    maturity_to_string(self.current_maturity),
+                )
+            return 0
+
+        # Bug 2 fix: catch exceptions so they don't escape to IDA's callback
+        # handler, which would continue with a corrupted MBA and hang at the
+        # next maturity level.  Mirrors InstructionOptimizerManager.func().
+        try:
+            nb_patch = self.optimize(blk)
+            return nb_patch
+        except RuntimeError as e:
+            optimizer_logger.warning(
+                "RuntimeError in block optimizer on blk %d: %s", blk.serial, e
+            )
+            # Disable remaining passes for this maturity after a runtime failure.
+            # Continuing to call block rules in the same maturity after an
+            # unknown IDA exception often re-enters with stale state.
+            self._pass_count = self._MAX_PASSES_PER_MATURITY + 1
+        except D810Exception as e:
+            optimizer_logger.warning(
+                "D810Exception in block optimizer on blk %d: %s", blk.serial, e
+            )
+            self._pass_count = self._MAX_PASSES_PER_MATURITY + 1
+        return 0
+
+    def log_info_on_input(self, blk: ida_hexrays.mblock_t):
+        mba: ida_hexrays.mbl_array_t = blk.mba
+
+        if (mba is not None) and (mba.maturity != self.current_maturity):
+            if main_logger.debug_on:
+                main_logger.debug(
+                    "BlockOptimizer called at maturity: %s",
+                    maturity_to_string(mba.maturity),
+                )
+
+            self.current_maturity = mba.maturity
+            self.reset_pass_counter()
+            self._invalidate_flow_context("maturity changed")
+
+    # statistics are managed centrally via the stats object
+
+    def _resolve_active_rules(
+        self, blk: ida_hexrays.mblock_t
+    ) -> tuple[FlowOptimizationRule, ...] | None:
+        if self._rule_scope_service is None:
+            # FAIL CLOSED: If rule scope service not initialized, run NO rules
+            # instead of ALL rules. This prevents hangs when optimizer callbacks
+            # fire before configure() is called.
+            optimizer_logger.warning(
+                "Rule scope service not initialized at block optimize time - no rules will run. "
+                "This may indicate a race condition during initialization."
+            )
+            return tuple()
+        if blk.mba is None or blk.mba.entry_ea is None:
+            return tuple()
+        if self.current_maturity is None:
+            return tuple()
+        t0_ns = time.perf_counter_ns()
+        rules = self._rule_scope_service.get_active_rules(
+            project_name=self._rule_scope_project_name,
+            idb_key=self._rule_scope_idb_key,
+            func_ea=int(blk.mba.entry_ea),
+            pipeline=PIPELINE_FLOW,
+            maturity=int(self.current_maturity),
+        )
+        self._perf_counters["scoped_lookup_ns"] += time.perf_counter_ns() - t0_ns
+        return rules
+
+    def _legacy_candidate_count(self, func_entry_ea: int) -> int:
+        count = 0
+        for cfg_rule in self.cfg_rules:
+            if self.check_if_rule_is_activated_for_address(cfg_rule, func_entry_ea):
+                count += 1
+        return count
+
+    @staticmethod
+    def _rule_priority(cfg_rule: FlowOptimizationRule) -> int:
+        raw_priority = getattr(cfg_rule, "priority", getattr(cfg_rule, "PRIORITY", 100))
+        try:
+            return int(raw_priority)
+        except (TypeError, ValueError):
+            return 100
+
+    def _order_rules_for_execution(
+        self, rules: tuple[FlowOptimizationRule, ...]
+    ) -> tuple[FlowOptimizationRule, ...]:
+        # Higher priority values run first. Name is a deterministic tiebreaker.
+        return tuple(
+            sorted(
+                rules,
+                key=lambda rule: (-self._rule_priority(rule), str(rule.name)),
+            )
+        )
+
+    def _group_rules_by_priority(
+        self, rules: tuple[FlowOptimizationRule, ...]
+    ) -> tuple[tuple[int, tuple[FlowOptimizationRule, ...]], ...]:
+        grouped: dict[int, list[FlowOptimizationRule]] = defaultdict(list)
+        for rule in rules:
+            grouped[self._rule_priority(rule)].append(rule)
+        return tuple(
+            (priority, tuple(grouped[priority]))
+            for priority in sorted(grouped.keys(), reverse=True)
+        )
+
+    def _get_or_create_flow_context(
+        self,
+        blk: ida_hexrays.mblock_t,
+        *,
+        phase_priority: int,
+        phase_index: int,
+        phase_rules: tuple[FlowOptimizationRule, ...],
+    ) -> FlowMaturityContext | None:
+        mba = blk.mba
+        if mba is None or mba.entry_ea is None or self.current_maturity is None:
+            return None
+        key = (int(mba.entry_ea), int(self.current_maturity))
+        if self._flow_context is None or self._flow_context_key != key:
+            self._flow_context = FlowMaturityContext(
+                mba=mba,
+                func_ea=int(mba.entry_ea),
+                maturity=int(self.current_maturity),
+            )
+            self._flow_context_key = key
+        else:
+            self._flow_context.refresh_mba(mba)
+        self._flow_context.set_phase(
+            priority=phase_priority,
+            phase_index=phase_index,
+            active_rule_names=tuple(str(rule.name) for rule in phase_rules),
+        )
+        self._flow_context.prime_for_rules(phase_rules)
+        return self._flow_context
+
+    def optimize(self, blk: ida_hexrays.mblock_t):
+        active_rules = self._resolve_active_rules(blk)
+        rules = active_rules if active_rules is not None else tuple(self.cfg_rules)
+        rules = self._order_rules_for_execution(rules)
+        phases = self._group_rules_by_priority(rules)
+        func_ea = int(blk.mba.entry_ea) if (blk.mba is not None and blk.mba.entry_ea is not None) else 0
+
+        if active_rules is not None:
+            self._perf_counters["scoped_calls"] += 1
+            self._perf_counters["scoped_candidates_total"] += len(rules)
+            if self._perf_compare_rule_scope and func_ea != 0:
+                self._perf_counters["legacy_candidates_total"] += self._legacy_candidate_count(func_ea)
+        else:
+            self._perf_counters["legacy_calls"] += 1
+            if func_ea != 0:
+                self._perf_counters["legacy_candidates_total"] += self._legacy_candidate_count(func_ea)
+            else:
+                self._perf_counters["legacy_candidates_total"] += len(rules)
+
+        for phase_index, (phase_priority, phase_rules) in enumerate(phases, start=1):
+            flow_context = self._get_or_create_flow_context(
+                blk,
+                phase_priority=phase_priority,
+                phase_index=phase_index,
+                phase_rules=phase_rules,
+            )
+            for cfg_rule in phase_rules:
+                cfg_rule.current_maturity = self.current_maturity
+                cfg_rule.set_flow_context(flow_context)
+                guard = blk.mba is not None and blk.mba.entry_ea is not None
+                if active_rules is None:
+                    guard &= self.check_if_rule_is_activated_for_address(
+                        cfg_rule, blk.mba.entry_ea
+                    )
+                if guard:
+                    nb_patch = cfg_rule.optimize(blk)
+                    if nb_patch > 0:
+                        optimizer_logger.info(
+                            "Rule {0} matched: {1} patches".format(cfg_rule.name, nb_patch)
+                        )
+                        if self.stats is not None:
+                            self.stats.record_cfg_rule_patches(cfg_rule.name, nb_patch)
+                        # Rebuild analysis context after any CFG write so lower
+                        # priorities see fresh facts on the next callback pass.
+                        self._invalidate_flow_context(
+                            f"{cfg_rule.name} applied {nb_patch} patch(es)"
+                        )
+                        return nb_patch
+        return 0
+
+    def add_rule(self, cfg_rule: FlowOptimizationRule):
+        optimizer_logger.info("Adding cfg rule {0}".format(cfg_rule))
+        if cfg_rule not in self.cfg_rules:
+            self.cfg_rules.append(cfg_rule)
+
+    def configure(self, **kwargs):
+        self._rule_scope_service = kwargs.get("rule_scope_service", self._rule_scope_service)
+        self._rule_scope_project_name = str(
+            kwargs.get("rule_scope_project_name", self._rule_scope_project_name)
+        )
+        self._rule_scope_idb_key = str(
+            kwargs.get("rule_scope_idb_key", self._rule_scope_idb_key)
+        )
+        self._perf_compare_rule_scope = bool(
+            kwargs.get("rule_scope_perf_compare", self._perf_compare_rule_scope)
+        )
+
+    def check_if_rule_is_activated_for_address(
+        self, cfg_rule: FlowOptimizationRule, func_entry_ea: int
+    ):
+        if cfg_rule.use_whitelist and (
+            func_entry_ea not in cfg_rule.whitelisted_function_ea_list
+        ):
+            return False
+        if cfg_rule.use_blacklist and (
+            func_entry_ea in cfg_rule.blacklisted_function_ea_list
+        ):
+            return False
+        return True
+
+
+class DecompilationEvent(enum.Enum):
+    STARTED = "decompilation_started"
+    FINISHED = "decompilation_finished"
+    MATURITY_CHANGED = "maturity_changed"
+
+
+class HexraysDecompilationHook(ida_hexrays.Hexrays_Hooks):
+    def __init__(
+        self,
+        callback: typing.Callable,
+        ctree_optimizer_manager: CtreeOptimizerManager | None = None,
+    ):
+        super().__init__()
+        self.callback = callback
+        self.ctree_optimizer_manager = ctree_optimizer_manager
+
+    def prolog(self, mba: ida_hexrays.mbl_array_t, fc, reachable_blocks, decomp_flags) -> "int":
+        main_logger.info("Starting decompilation of function at %s", hex(mba.entry_ea))
+        self.callback(DecompilationEvent.STARTED)
+        # self.manager.start_profiling()
+        # self.manager.instruction_optimizer.reset_rule_usage_statistic()
+        # self.manager.block_optimizer.reset_rule_usage_statistic()
+        return 0
+
+    def maturity(self, cfunc, new_maturity: int) -> int:
+        """Ctree maturity level is being changed."""
+        if self.ctree_optimizer_manager is not None:
+            self.ctree_optimizer_manager.on_maturity(cfunc, new_maturity)
+        return 0
+
+    def glbopt(self, mba: ida_hexrays.mbl_array_t) -> "int":
+        main_logger.info("glbopt finished for function at %s", hex(mba.entry_ea))
+        main_logger.reset_maturity()
+        return 0
+
+    def structural(self, ct: "control_graph_t") -> int:  # type: ignore
+        """Structural analysis has been finished.
+
+        @param ct: (control_graph_t *)"""
+        main_logger.info("Structural analysis has been finished")
+        self.callback(DecompilationEvent.FINISHED)
+        return 0
+
+    def func_printed(self, cfunc: "cfunc_t") -> int:
+        """Function text has been generated. Plugins may modify the text in cfunc_t::sv. However, it is too late to modify the ctree or microcode. The text uses regular color codes (see lines.hpp) COLOR_ADDR is used to store pointers to ctree items.
+
+        @param cfunc: (cfunc_t *)"""
+        main_logger.info("Function text has been generated")
+        return 0
